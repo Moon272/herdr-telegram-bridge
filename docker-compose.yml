@@ -1,0 +1,16 @@
+version: "3.8"
+
+services:
+  herdr-telegram-bridge:
+    build: .
+    container_name: herdr-telegram-bridge
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      # Gắn socket Herdr từ host vào container
+      - ${HOME}/.config/herdr:/root/.config/herdr:rw
+      - ./logs:/app/logs:rw
+    environment:
+      - HERDR_SOCKET_PATH=/root/.config/herdr/herdr.sock
+

@@ -1,0 +1,28 @@
+# ==============================================================================
+# CCGram v4 Configuration for Herdr Backend
+# Tham chiếu: alexei-led/ccgram
+# ==============================================================================
+
+telegram:
+  bot_token: "${TELEGRAM_BOT_TOKEN}"
+  chat_id: "${TELEGRAM_FORUM_GROUP_ID}" # Telegram Supergroup bật Forum Topics
+  allowed_users:
+    - 12345678
+
+multiplexer:
+  # Chọn backend là herdr (hỗ trợ từ CCGram v4.0.0+)
+  backend: "herdr"
+  herdr:
+    # Socket path hoặc tên session
+    socket_path: "${HOME}/.config/herdr/herdr.sock"
+    session: "default"
+    # Cách đặt tên Topic Telegram: "workspace ▸ tab"
+    topic_label_format: "{workspace} ▸ {tab}"
+    # Tự động lọc các tab đang chạy agent
+    auto_sync_topics: true
+
+agent_hooks:
+  enable_inline_keyboards: true
+  capture_terminal_screenshots: false
+  notify_on_blocked: true
+
