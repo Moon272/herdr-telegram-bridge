@@ -11,6 +11,7 @@ Nguyên tắc an toàn cốt lõi:
 3. Sanitized Inputs: Kiểm tra và làm sạch toàn bộ dữ liệu đầu vào.
 4. Rate Limiting: Chống spam và DoS bot.
 5. Audit Logging: Lưu vết toàn bộ hành động người dùng gửi vào log file.
+6. Proactive Approval Push: Tự động phát hiện khi agent bị blocked và gửi thông báo kèm nút phê duyệt.
 """
 
 import os
@@ -20,8 +21,7 @@ import time
 import re
 import logging
 import asyncio
-import subprocess
-from typing import List, Optional, Dict, Any, Tuple
+from typing import List, Optional, Dict, Any, Tuple, Set
 from collections import defaultdict
 from pathlib import Path
 from dotenv import load_dotenv
@@ -66,7 +66,7 @@ logger = logging.getLogger("HerdrTelegramBridge")
 
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
 raw_allowlist = os.environ.get("ALLOWED_TELEGRAM_USER_IDS", "").strip()
-ALLOWED_USERS = set()
+ALLOWED_USERS: Set[int] = set()
 if raw_allowlist:
     for uid in raw_allowlist.split(","):
         uid = uid.strip()
@@ -76,8 +76,24 @@ if raw_allowlist:
 RATE_LIMIT_MAX_CALLS = int(os.environ.get("RATE_LIMIT_MAX_CALLS", "10"))
 RATE_LIMIT_PERIOD_SEC = int(os.environ.get("RATE_LIMIT_PERIOD_SEC", "60"))
 
+# Cấu hình giám sát tự động
+AUTO_NOTIFY_BLOCKED = os.environ.get("AUTO_NOTIFY_BLOCKED", "true").lower() in ("1", "true", "yes")
+POLL_INTERVAL_SEC = float(os.environ.get("POLL_INTERVAL_SEC", "3"))
+
+NOTIFICATION_CHAT_IDS: Set[int] = set(ALLOWED_USERS)
+raw_notify_chats = os.environ.get("NOTIFICATION_CHAT_IDS", "").strip()
+if raw_notify_chats:
+    for cid in raw_notify_chats.split(","):
+        cid = cid.strip()
+        if cid.lstrip("-").isdigit():
+            NOTIFICATION_CHAT_IDS.add(int(cid))
+
 # Rate limiting storage: user_id -> [timestamps]
 user_call_history: Dict[int, List[float]] = defaultdict(list)
+
+# Trạng thái theo dõi các agent đang chạy trong background:
+# key: f"{pane_id}:{agent_name}" -> Dict[str, Any]
+monitored_agent_states: Dict[str, Dict[str, Any]] = {}
 
 # ------------------------------------------------------------------------------
 # Helper & Security Decorators
@@ -86,7 +102,6 @@ def is_rate_limited(user_id: int) -> bool:
     """Kiểm tra giới hạn tần suất gọi lệnh."""
     now = time.time()
     history = user_call_history[user_id]
-    # Lọc các lần gọi trong khung thời gian
     valid_calls = [t for t in history if now - t < RATE_LIMIT_PERIOD_SEC]
     user_call_history[user_id] = valid_calls
     if len(valid_calls) >= RATE_LIMIT_MAX_CALLS:
@@ -152,8 +167,54 @@ async def run_herdr_cmd(args: List[str]) -> Dict[str, Any]:
             "success": False
         }
 
+async def approve_agent(pane_id: str, agent_name: str) -> Tuple[bool, str]:
+    """Phê duyệt yêu cầu của agent bị blocked.
+    Gửi 'y' kèm Enter vào terminal pane hoặc gửi Enter vào agent.
+    """
+    logger.info(f"Đang thực hiện phê duyệt agent `{agent_name}` (Pane `{pane_id}`) ...")
+    if pane_id:
+        # Gửi chuỗi 'y' rồi phím Enter vào pane terminal
+        await run_herdr_cmd(["pane", "send-text", pane_id, "y"])
+        r_enter = await run_herdr_cmd(["pane", "send-keys", pane_id, "enter"])
+        if r_enter["success"]:
+            return True, "Đã gửi xác nhận 'y' + Enter tới terminal pane"
+
+    if agent_name and agent_name != "Unknown":
+        r_keys = await run_herdr_cmd(["agent", "send-keys", agent_name, "enter"])
+        if r_keys["success"]:
+            return True, "Đã gửi phím Enter tới agent"
+        r_prompt = await run_herdr_cmd(["agent", "prompt", agent_name, "y"])
+        if r_prompt["success"]:
+            return True, "Đã gửi prompt 'y' tới agent"
+
+    return False, "Không thể gửi phím phê duyệt tới pane hoặc agent"
+
+async def reject_agent(pane_id: str, agent_name: str) -> Tuple[bool, str]:
+    """Từ chối yêu cầu của agent bị blocked.
+    Gửi 'n' kèm Enter hoặc Esc / Ctrl+C vào pane terminal.
+    """
+    logger.info(f"Đang thực hiện từ chối agent `{agent_name}` (Pane `{pane_id}`) ...")
+    if pane_id:
+        await run_herdr_cmd(["pane", "send-text", pane_id, "n"])
+        r_enter = await run_herdr_cmd(["pane", "send-keys", pane_id, "enter"])
+        if r_enter["success"]:
+            return True, "Đã gửi từ chối 'n' + Enter tới terminal pane"
+        r_esc = await run_herdr_cmd(["pane", "send-keys", pane_id, "esc"])
+        if r_esc["success"]:
+            return True, "Đã gửi phím Escape tới terminal pane"
+
+    if agent_name and agent_name != "Unknown":
+        r_esc = await run_herdr_cmd(["agent", "send-keys", agent_name, "esc"])
+        if r_esc["success"]:
+            return True, "Đã gửi phím Escape tới agent"
+        r_prompt = await run_herdr_cmd(["agent", "prompt", agent_name, "n"])
+        if r_prompt["success"]:
+            return True, "Đã gửi prompt 'n' tới agent"
+
+    return False, "Không thể gửi tín hiệu từ chối tới pane hoặc agent"
+
 # ------------------------------------------------------------------------------
-# Visual Formatting & UI Helpers (Option 1: Semantic Rich Cards)
+# Visual Formatting & UI Helpers
 # ------------------------------------------------------------------------------
 ANSI_REGEX = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
 
@@ -257,10 +318,10 @@ def format_agents_card(raw_stdout: str) -> Tuple[str, Optional[InlineKeyboardMar
         keyboard = []
 
         for ag in agents:
-            name = ag.get("name") or ag.get("agent_id") or ag.get("id") or "Unknown"
-            kind = ag.get("kind") or ag.get("type") or "Agent"
+            name = ag.get("agent") or ag.get("name") or ag.get("agent_id") or ag.get("id") or "Unknown"
+            kind = ag.get("agent_session", {}).get("agent") or ag.get("kind") or ag.get("type") or "Agent"
             pane_id = ag.get("pane_id", "")
-            status_raw = ag.get("status") or ag.get("lifecycle_state") or ag.get("state") or "unknown"
+            status_raw = ag.get("agent_status") or ag.get("status") or ag.get("lifecycle_state") or ag.get("state") or "unknown"
             status_badge = format_agent_status_badge(status_raw)
             ws_id = ag.get("workspace_id", "")
 
@@ -271,12 +332,11 @@ def format_agents_card(raw_stdout: str) -> Tuple[str, Optional[InlineKeyboardMar
                 f"   ▫️ *Trạng thái:* {status_badge}"
             )
 
-            # Nút tương tác cho từng agent
             row_buttons = []
-            if "blocked" in status_raw.lower() or "wait" in status_raw.lower():
+            if any(k in status_raw.lower() for k in ("blocked", "wait", "approval", "question")):
                 row_buttons.extend([
-                    InlineKeyboardButton(f"✅ Duyệt {name}", callback_data=f"approve_{name}"),
-                    InlineKeyboardButton(f"❌ Từ chối {name}", callback_data=f"reject_{name}")
+                    InlineKeyboardButton(f"✅ Duyệt {name}", callback_data=f"autoapprove:{pane_id}:{name}"),
+                    InlineKeyboardButton(f"❌ Từ chối {name}", callback_data=f"autoreject:{pane_id}:{name}")
                 ])
             if pane_id:
                 row_buttons.append(
@@ -292,6 +352,125 @@ def format_agents_card(raw_stdout: str) -> Tuple[str, Optional[InlineKeyboardMar
         return f"🤖 *Danh sách AI Agents:*\n```text\n{raw_stdout}\n```", None
 
 # ------------------------------------------------------------------------------
+# Proactive Background Monitor (Tự động gửi thông báo phê duyệt)
+# ------------------------------------------------------------------------------
+async def monitor_agents_job(context: ContextTypes.DEFAULT_TYPE):
+    """Job nền chạy lặp lại định kỳ để phát hiện agent bị Blocked và tự động gửi thông báo duyệt."""
+    if not AUTO_NOTIFY_BLOCKED or not NOTIFICATION_CHAT_IDS:
+        return
+
+    res = await run_herdr_cmd(["agent", "list"])
+    if not res["success"] or not res["stdout"]:
+        return
+
+    try:
+        data = json.loads(res["stdout"])
+        agents = data.get("result", {}).get("agents", [])
+    except Exception as e:
+        logger.debug(f"Không thể parse JSON herdr agent list: {e}")
+        return
+
+    active_keys = set()
+    for ag in agents:
+        agent_name = ag.get("agent") or ag.get("name") or ag.get("agent_id") or ag.get("id") or "Unknown"
+        pane_id = ag.get("pane_id", "")
+        workspace_id = ag.get("workspace_id", "")
+        status_raw = ag.get("agent_status") or ag.get("status") or ag.get("lifecycle_state") or ag.get("state") or "unknown"
+        status = status_raw.lower()
+        seq = ag.get("state_change_seq", 0)
+        key = f"{pane_id}:{agent_name}"
+        active_keys.add(key)
+
+        is_blocked = any(k in status for k in ("blocked", "wait", "question", "approval"))
+
+        if is_blocked:
+            prev = monitored_agent_states.get(key)
+            # Nếu chưa từng thông báo hoặc số thứ tự thay đổi (lần hỏi mới) hoặc trước đó không blocked
+            if not prev or prev.get("seq") != seq or not prev.get("is_blocked"):
+                logger.info(f"Phát hiện Agent `{agent_name}` (Pane `{pane_id}`) chuyển sang trạng thái BLOCKED! Đang gửi thông báo duyệt...")
+
+                # Trích xuất 15 dòng log gần nhất để người dùng nắm được ngữ cảnh agent đang xin duyệt gì
+                terminal_snippet = "(Không có nội dung hiển thị trong terminal)"
+                if pane_id:
+                    read_res = await run_herdr_cmd(["pane", "read", pane_id, "--lines", "15"])
+                    if read_res["success"]:
+                        cleaned = strip_ansi(read_res["stdout"]).strip()
+                        if cleaned:
+                            terminal_snippet = cleaned[-1500:]
+
+                msg_text = (
+                    "🚨 *YÊU CẦU PHÊ DUYỆT TỪ AI AGENT!*\n"
+                    "━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                    f"🤖 *Agent:* `{agent_name}`\n"
+                    f"📍 *Vị trí:* Pane `{pane_id}` (Workspace `{workspace_id}`)\n"
+                    f"⚠️ *Trạng thái:* {format_agent_status_badge(status_raw)}\n\n"
+                    f"📋 *Nội dung terminal gần nhất:*\n"
+                    f"```text\n{terminal_snippet}\n```\n"
+                    "👉 _Bấm nút bên dưới để Duyệt / Từ chối hoặc **Reply** trực tiếp tin nhắn này._"
+                )
+
+                keyboard = [
+                    [
+                        InlineKeyboardButton("✅ Phê duyệt (y)", callback_data=f"autoapprove:{pane_id}:{agent_name}"),
+                        InlineKeyboardButton("❌ Từ chối (n)", callback_data=f"autoreject:{pane_id}:{agent_name}"),
+                    ],
+                    [
+                        InlineKeyboardButton("📜 Xem 30 dòng Log", callback_data=f"logs_{pane_id}"),
+                        InlineKeyboardButton("🛑 Dừng (Ctrl+C)", callback_data=f"autostop:{pane_id}:{agent_name}"),
+                    ]
+                ]
+                reply_markup = InlineKeyboardMarkup(keyboard)
+
+                sent_records = []
+                for chat_id in NOTIFICATION_CHAT_IDS:
+                    try:
+                        sent_msg = await context.bot.send_message(
+                            chat_id=chat_id,
+                            text=msg_text,
+                            parse_mode="Markdown",
+                            reply_markup=reply_markup
+                        )
+                        sent_records.append({"chat_id": chat_id, "message_id": sent_msg.message_id})
+                    except Exception as e:
+                        logger.error(f"Lỗi gửi thông báo tự động tới chat {chat_id}: {e}")
+
+                monitored_agent_states[key] = {
+                    "seq": seq,
+                    "is_blocked": True,
+                    "status": status,
+                    "pane_id": pane_id,
+                    "agent_name": agent_name,
+                    "messages": sent_records,
+                    "notified_at": time.time(),
+                }
+        else:
+            # Agent không còn blocked (ví dụ: đã chuyển sang working, idle, done)
+            if key in monitored_agent_states and monitored_agent_states[key].get("is_blocked"):
+                prev = monitored_agent_states[key]
+                logger.info(f"Agent `{agent_name}` (Pane `{pane_id}`) đã chuyển trạng thái từ blocked sang: {status_raw}. Cập nhật tin nhắn Telegram...")
+                for msg_rec in prev.get("messages", []):
+                    try:
+                        await context.bot.edit_message_text(
+                            chat_id=msg_rec["chat_id"],
+                            message_id=msg_rec["message_id"],
+                            text=(
+                                f"ℹ️ *Agent `{agent_name}` (Pane `{pane_id}`)* đã tiếp tục hoạt động.\n"
+                                f"Trạng thái hiện tại: {format_agent_status_badge(status_raw)}"
+                            ),
+                            parse_mode="Markdown"
+                        )
+                    except Exception:
+                        pass
+                monitored_agent_states[key]["is_blocked"] = False
+                monitored_agent_states[key]["status"] = status
+                monitored_agent_states[key]["seq"] = seq
+
+    # Dọn dẹp các agent đã kết thúc / đóng pane
+    for dead_key in list(monitored_agent_states.keys()):
+        if dead_key not in active_keys:
+            del monitored_agent_states[dead_key]
+
+# ------------------------------------------------------------------------------
 # Bot Command Handlers
 # ------------------------------------------------------------------------------
 @check_permission
@@ -305,9 +484,11 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• `/status` — Kiểm tra trạng thái hệ thống Herdr Server & Client\n"
         "• `/workspaces` — Danh sách các workspace đang hoạt động\n"
         "• `/agents` — Danh sách các AI Agents & nút phê duyệt\n"
-        "• `/logs <pane_id>` — Xem 25 dòng log mới nhất của pane\n"
+        "• `/logs <pane_id>` — Xem 30 dòng log mới nhất của pane\n"
         "• `/prompt <agent> <msg>` — Gửi chỉ thị mới cho agent\n"
-        "• `/stop <pane_id>` — Dừng tiến trình bằng tín hiệu Ctrl+C\n"
+        "• `/reply <pane_id> <msg>` — Gửi phản hồi / văn bản trực tiếp vào terminal pane\n"
+        "• `/stop <pane_id>` — Dừng tiến trình bằng tín hiệu Ctrl+C\n\n"
+        "💡 *Tự động phê duyệt:* Khi agent yêu cầu xác nhận, bot sẽ chủ động gửi tin nhắn kèm nút bấm và bạn cũng có thể Reply tin nhắn đó."
     )
     await update.message.reply_text(text, parse_mode="Markdown")
 
@@ -358,13 +539,13 @@ async def cmd_logs(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             "⚠️ Vui lòng cung cấp Pane ID:\n"
             "Sử dụng: `/logs <pane_id>`\n"
-            "Ví dụ: `/logs w1:p2`",
+            "Ví dụ: `/logs w3:p1`",
             parse_mode="Markdown"
         )
         return
 
     pane_id = context.args[0].strip()
-    res = await run_herdr_cmd(["pane", "read", pane_id, "--lines", "25"])
+    res = await run_herdr_cmd(["pane", "read", pane_id, "--lines", "30"])
     if not res["success"]:
         await update.message.reply_text(f"❌ Không thể đọc log từ pane `{pane_id}`:\n```text\n{res['stderr']}\n```", parse_mode="Markdown")
         return
@@ -376,7 +557,7 @@ async def cmd_logs(update: Update, context: ContextTypes.DEFAULT_TYPE):
         raw_text = "..." + raw_text[-3500:]
 
     text = (
-        f"📜 *LOGS PANE `{pane_id}`* _(25 dòng gần nhất)_\n"
+        f"📜 *LOGS PANE `{pane_id}`* _(30 dòng gần nhất)_\n"
         f"━━━━━━━━━━━━━━━━━━\n"
         f"```text\n{raw_text}\n```"
     )
@@ -388,7 +569,7 @@ async def cmd_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if len(context.args) < 2:
         await update.message.reply_text(
             "⚠️ Cú pháp: `/prompt <tên_agent> <nội dung prompt>`\n"
-            "Ví dụ: `/prompt reviewer Kiểm tra lại hàm authenticate`",
+            "Ví dụ: `/prompt agy Kiểm tra lại mã nguồn`",
             parse_mode="Markdown"
         )
         return
@@ -404,12 +585,34 @@ async def cmd_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"❌ Lỗi gửi prompt tới `{agent_name}`:\n{res['stderr']}", parse_mode="Markdown")
 
 @check_permission
+async def cmd_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Lệnh /reply <pane_id> <nội dung>: Gửi chuỗi văn bản kèm phím Enter trực tiếp vào terminal pane."""
+    if len(context.args) < 2:
+        await update.message.reply_text(
+            "⚠️ Cú pháp: `/reply <pane_id> <nội dung>`\n"
+            "Ví dụ: `/reply w3:p1 y`\n"
+            "Ví dụ: `/reply w3:p1 1`",
+            parse_mode="Markdown"
+        )
+        return
+
+    pane_id = context.args[0].strip()
+    reply_text = " ".join(context.args[1:]).strip()
+
+    await run_herdr_cmd(["pane", "send-text", pane_id, reply_text])
+    res = await run_herdr_cmd(["pane", "send-keys", pane_id, "enter"])
+    if res["success"]:
+        await update.message.reply_text(f"✅ Đã gửi phản hồi vào Pane `{pane_id}`:\n```text\n{reply_text}\n```", parse_mode="Markdown")
+    else:
+        await update.message.reply_text(f"❌ Lỗi gửi phản hồi vào Pane `{pane_id}`:\n{res['stderr']}", parse_mode="Markdown")
+
+@check_permission
 async def cmd_stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Lệnh /stop <pane_id hoặc agent_name>: Gửi Ctrl+C dừng tiến trình."""
     if not context.args:
         await update.message.reply_text(
             "⚠️ Vui lòng cung cấp Pane ID hoặc tên Agent cần dừng:\n"
-            "Sử dụng: `/stop <pane_id>` (ví dụ: `/stop w1:p2`)\n"
+            "Sử dụng: `/stop <pane_id>` (ví dụ: `/stop w3:p1`)\n"
             "Hoặc: `/stop <agent_name>`",
             parse_mode="Markdown"
         )
@@ -433,25 +636,60 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
     await query.answer()
 
     data = query.data
-    if data.startswith("approve_"):
-        agent_id = data.replace("approve_", "")
-        res = await run_herdr_cmd(["agent", "prompt", agent_id, "y"])
-        if res["success"]:
-            await query.edit_message_text(f"✅ Đã phê chuẩn yêu cầu tiếp tục của agent `{agent_id}`.", parse_mode="Markdown")
-        else:
-            await query.edit_message_text(f"❌ Thao tác duyệt thất bại: {res['stderr']}", parse_mode="Markdown")
+    user = update.effective_user
+    username = f"@{user.username}" if user and user.username else f"ID {user.id}"
 
-    elif data.startswith("reject_"):
-        agent_id = data.replace("reject_", "")
-        res = await run_herdr_cmd(["agent", "prompt", agent_id, "n"])
-        if res["success"]:
-            await query.edit_message_text(f"❌ Đã từ chối hành động của agent `{agent_id}`.", parse_mode="Markdown")
+    if data.startswith("autoapprove:") or data.startswith("approve_"):
+        if ":" in data:
+            _, pane_id, agent_name = data.split(":", 2)
         else:
-            await query.edit_message_text(f"❌ Thao tác từ chối thất bại: {res['stderr']}", parse_mode="Markdown")
+            agent_name = data.replace("approve_", "")
+            pane_id = ""
+
+        success, detail = await approve_agent(pane_id, agent_name)
+        if success:
+            await query.edit_message_text(
+                f"✅ *ĐÃ PHÊ DUYỆT BỞI {username}*\n"
+                f"🤖 Agent: `{agent_name}`" + (f" | Pane: `{pane_id}`" if pane_id else "") + "\n"
+                f"⚡ {detail}. Agent đang tiếp tục tiến trình.",
+                parse_mode="Markdown"
+            )
+        else:
+            await query.edit_message_text(f"❌ Phê duyệt thất bại: {detail}", parse_mode="Markdown")
+
+    elif data.startswith("autoreject:") or data.startswith("reject_"):
+        if ":" in data:
+            _, pane_id, agent_name = data.split(":", 2)
+        else:
+            agent_name = data.replace("reject_", "")
+            pane_id = ""
+
+        success, detail = await reject_agent(pane_id, agent_name)
+        if success:
+            await query.edit_message_text(
+                f"❌ *ĐÃ TỪ CHỐI BỞI {username}*\n"
+                f"🤖 Agent: `{agent_name}`" + (f" | Pane: `{pane_id}`" if pane_id else "") + "\n"
+                f"🛑 {detail}.",
+                parse_mode="Markdown"
+            )
+        else:
+            await query.edit_message_text(f"❌ Thao tác từ chối thất bại: {detail}", parse_mode="Markdown")
+
+    elif data.startswith("autostop:"):
+        _, pane_id, agent_name = data.split(":", 2)
+        res = await run_herdr_cmd(["pane", "send-keys", pane_id, "ctrl+c"])
+        if res["success"]:
+            await query.edit_message_text(
+                f"🛑 *ĐÃ DỪNG TIẾN TRÌNH (Ctrl+C) BỞI {username}*\n"
+                f"🤖 Agent: `{agent_name}` | Pane: `{pane_id}`",
+                parse_mode="Markdown"
+            )
+        else:
+            await query.edit_message_text(f"❌ Không thể dừng tiến trình: {res['stderr']}", parse_mode="Markdown")
 
     elif data.startswith("logs_"):
         pane_id = data.replace("logs_", "")
-        res = await run_herdr_cmd(["pane", "read", pane_id, "--lines", "25"])
+        res = await run_herdr_cmd(["pane", "read", pane_id, "--lines", "30"])
         if not res["success"]:
             await query.message.reply_text(f"❌ Không thể đọc log từ pane `{pane_id}`:\n```text\n{res['stderr']}\n```", parse_mode="Markdown")
             return
@@ -463,11 +701,44 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             raw_text = "..." + raw_text[-3500:]
 
         log_msg = (
-            f"📜 *LOGS PANE `{pane_id}`* _(25 dòng gần nhất)_\n"
+            f"📜 *LOGS PANE `{pane_id}`* _(30 dòng gần nhất)_\n"
             f"━━━━━━━━━━━━━━━━━━\n"
             f"```text\n{raw_text}\n```"
         )
         await query.message.reply_text(log_msg, parse_mode="Markdown")
+
+@check_permission
+async def handle_user_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Khi người dùng Reply trực tiếp một tin nhắn thông báo trên Telegram để nhập văn bản vào terminal."""
+    if not update.message or not update.message.reply_to_message:
+        return
+
+    replied_text = update.message.reply_to_message.text or ""
+    user_input = update.message.text.strip()
+    if not user_input:
+        return
+
+    # Tìm pane_id từ tin nhắn gốc (ví dụ: Pane `w3:p1`)
+    match = re.search(r"Pane\s+`([a-zA-Z0-9_\-:]+)`", replied_text)
+    if not match:
+        return
+
+    pane_id = match.group(1)
+    logger.info(f"Người dùng reply trực tiếp vào Pane {pane_id}: {user_input}")
+
+    await run_herdr_cmd(["pane", "send-text", pane_id, user_input])
+    r_enter = await run_herdr_cmd(["pane", "send-keys", pane_id, "enter"])
+
+    if r_enter["success"]:
+        await update.message.reply_text(
+            f"✅ Đã chuyển nội dung tới Pane `{pane_id}`:\n```text\n{user_input}\n```",
+            parse_mode="Markdown"
+        )
+    else:
+        await update.message.reply_text(
+            f"❌ Không thể gửi tới Pane `{pane_id}`:\n```text\n{r_enter['stderr']}\n```",
+            parse_mode="Markdown"
+        )
 
 # ------------------------------------------------------------------------------
 # Khởi động ứng dụng
@@ -482,22 +753,31 @@ def main():
         sys.exit(1)
 
     logger.info(f"Khởi động Herdr Telegram Bridge với {len(ALLOWED_USERS)} users được cấp phép.")
+    if AUTO_NOTIFY_BLOCKED:
+        logger.info(f"Bật chế độ tự động giám sát và thông báo duyệt (chu kỳ: {POLL_INTERVAL_SEC}s).")
 
     app = Application.builder().token(BOT_TOKEN).build()
 
-    # Đăng ký lệnh
+    # Đăng ký job nền định kỳ để giám sát agent và gửi thông báo duyệt
+    if AUTO_NOTIFY_BLOCKED and app.job_queue:
+        app.job_queue.run_repeating(monitor_agents_job, interval=POLL_INTERVAL_SEC, first=2)
+
+    # Đăng ký lệnh bot
     app.add_handler(CommandHandler(["start", "help"], cmd_start))
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("workspaces", cmd_workspaces))
     app.add_handler(CommandHandler("agents", cmd_agents))
     app.add_handler(CommandHandler("logs", cmd_logs))
     app.add_handler(CommandHandler("prompt", cmd_prompt))
+    app.add_handler(CommandHandler("reply", cmd_reply))
     app.add_handler(CommandHandler("stop", cmd_stop))
     app.add_handler(CallbackQueryHandler(handle_callback_query))
+
+    # Xử lý khi người dùng Reply tin nhắn thông báo
+    app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_user_reply))
 
     # Chạy bot ở chế độ long-polling
     app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
     main()
-
