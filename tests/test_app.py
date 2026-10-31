@@ -19,6 +19,11 @@ def runtime():
     client.run = AsyncMock(return_value=CommandResult(True))
     rt = Runtime(config, client, names=NameStore())
     rt.agents = AsyncMock(return_value=[agent()])
+
+    async def panes():
+        return [{"pane_id": a.pane, "terminal_id": a.terminal_id} for a in await rt.agents()]
+
+    rt.panes = AsyncMock(side_effect=panes)
     return rt
 
 
@@ -120,7 +125,12 @@ def test_confirmation_network_failure_never_replays_terminal_write():
 def test_workspace_ambiguity_and_plain_terminal_support():
     async def scenario():
         rt = runtime()
-        rt.panes = AsyncMock(return_value=[{"pane_id": "w1:p1"}, {"pane_id": "w1:p2"}])
+        rt.panes = AsyncMock(
+            return_value=[
+                {"pane_id": "w1:p1", "terminal_id": "t1"},
+                {"pane_id": "w1:p2", "terminal_id": "t2"},
+            ]
+        )
         with pytest.raises(ValueError):
             await rt.find("w1")
         plain = await rt.find("w1:p2")

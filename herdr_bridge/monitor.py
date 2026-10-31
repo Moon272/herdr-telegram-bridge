@@ -28,12 +28,15 @@ class Monitor:
         self.clock = clock
         self.previous = {}
         self.pending = []
+        self.chat_due = {}
         self.lock = asyncio.Lock()
 
     async def tick(self, context):
         if self.lock.locked():
             return
         async with self.lock:
+            now = self.clock()
+            self.chat_due = {chat: due for chat, due in self.chat_due.items() if due > now}
             agents = await self.runtime.agents()
             if agents is None:
                 return  # An unavailable CLI is not an empty snapshot.
@@ -62,7 +65,7 @@ class Monitor:
                 # Never deliver stale controls, including an idle event superseded by work.
                 if latest is None or latest.version != delivery.agent.version:
                     continue
-                if delivery.due > now:
+                if max(delivery.due, self.chat_due.get(delivery.chat, 0)) > now:
                     remaining.append(delivery)
                     continue
                 try:
@@ -70,6 +73,9 @@ class Monitor:
                 except RetryAfter as exc:
                     seconds = exc.retry_after
                     seconds = seconds.total_seconds() if isinstance(seconds, timedelta) else float(seconds)
+                    self.chat_due[delivery.chat] = max(
+                        self.chat_due.get(delivery.chat, 0), self.clock() + max(seconds, 0)
+                    )
                     self.retry(delivery, max(seconds, 0), remaining)
                 except (BadRequest, Forbidden):
                     # BadRequest subclasses NetworkError in PTB: permanent errors must come first.

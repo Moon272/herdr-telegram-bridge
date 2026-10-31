@@ -6,7 +6,7 @@ from herdr_bridge.state import Agent, RateLimiter, Registry, transitions
 
 
 def agent(status="blocked", seq=1, completion=0, pane="w1:p1"):
-    return Agent("agent", pane, "w1", status, status, seq, completion)
+    return Agent("agent", pane, "w1", status, status, seq, completion, terminal_id="terminal:" + pane)
 
 
 def bound(registry, chat=1, message=10, snapshot=None):

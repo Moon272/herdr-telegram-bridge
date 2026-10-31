@@ -69,6 +69,10 @@ Tin nhắn tự do không reply chỉ được chuyển tiếp khi có đúng m�
 không tự gửi vào agent idle. Muốn giao việc cho agent idle, dùng reply một
 thông báo mới hoặc `/prompt`.
 
+`/reply` giữ nguyên nội dung từ ký tự đầu tiên sau phần phân cách cú pháp,
+bao gồm xuống dòng, thụt lề, tab, dấu ngoặc kép và khoảng trắng cuối. Khoảng trắng
+trước ký tự đầu tiên của nội dung được xem là phần phân cách, không được gửi.
+
 ## Phân biệt nhiều phiên Codex
 
 `/agents` và nút **Agents** chỉ trả danh sách ngắn, không đọc log terminal hay
@@ -131,13 +135,22 @@ prompt/phím được định tuyến bằng pane ID sau khi kiểm tra lại te
 - Metadata giữ tối đa 10.000 tin nhắn. Nút hết hạn được làm mới bằng `/agents <pane_id>`.
 - Mỗi pane chỉ nhận một thao tác ghi tại một thời điểm. Gửi chữ thất bại sẽ
   không gửi Enter; gửi chữ thành công nhưng Enter lỗi sẽ báo riêng.
+- Trước khi gửi prompt, text hoặc bất kỳ phím nào, bridge kiểm tra lại
+  `terminal_id` trong khóa của pane và đối chiếu với `pane list`. Nếu `agent list`
+  thiếu ID, bridge chỉ bổ sung từ một pane khớp duy nhất. Thiếu ID, dữ liệu
+  mâu thuẫn hoặc lỗi đọc CLI sẽ chặn thao tác ghi; vẫn có thể xem trạng thái/log
+  và đặt tên phiên. CLI cũ không cung cấp ID cần được nâng cấp để điều khiển.
+  Kiểm tra phía bridge không làm thao tác xác minh và ghi trở thành nguyên tử
+  với Herdr; vẫn có một khoảng thời gian giữa hai lệnh CLI.
 - Gửi text, phím và prompt không được tự retry: timeout có thể có nghĩa lệnh
   đã chạy. Kiểm tra pane trước khi chủ động gửi lại. Nút xác nhận đã dùng hoặc
   có kết quả không chắc chắn sẽ không được dùng lại; các bản thông báo cùng
   trạng thái ở những chat khác cũng bị vô hiệu hóa cho thao tác ghi.
 - Thông báo được retry riêng từng chat tối đa 3 lần sau lần gửi đầu, chờ
   3/10/30 giây cho lỗi mạng hoặc theo `RetryAfter` của Telegram. Thời điểm thực
-  tế phụ thuộc chu kỳ monitor. Lỗi chat bị chặn/cấu hình sai không retry.
+  tế phụ thuộc chu kỳ monitor. `RetryAfter` hoãn mọi thông báo của cùng chat,
+  kể cả sự kiện mới trong thời gian chờ; chat khác tiếp tục được xử lý. Sự kiện
+  chưa được thử gửi không bị trừ lượt retry. Lỗi chat bị chặn/cấu hình sai không retry.
   Sự kiện đã bị trạng thái mới thay thế sẽ bị hủy; hết lượt retry được ghi log.
 - Không lưu metadata/hàng đợi qua restart. Khi khởi động lại, chỉ thông báo
   agent đang blocked; không phát lại thông báo hoàn thành cũ.

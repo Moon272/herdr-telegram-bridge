@@ -80,6 +80,18 @@ class Runtime:
             if not isinstance(rows, list) or not all(isinstance(row, dict) for row in rows):
                 raise ValueError()
             agents = [Agent.parse(row) for row in rows]
+            if any(not a.terminal_id for a in agents):
+                try:
+                    panes = await self.panes()
+                except ValueError:
+                    panes = []
+                enriched = []
+                for agent in agents:
+                    matches = [row for row in panes if row.get("pane_id") == agent.pane]
+                    if not agent.terminal_id and len(matches) == 1:
+                        agent = replace(agent, terminal_id=Agent.parse(matches[0]).terminal_id)
+                    enriched.append(agent)
+                agents = enriched
             agents = [replace(a, alias=self.names.get(a)) for a in agents]
             # Workspace labels are display context; failure must not hide otherwise valid agents.
             workspaces = await self.client.run(["workspace", "list"])
@@ -143,7 +155,16 @@ class Runtime:
                 pane = panes[0]["pane_id"]
                 matches = [a for a in agents if a.pane == pane]
                 if not matches:
-                    matches = [Agent("", pane, pane.split(":")[0], "unknown", "unknown")]
+                    matches = [
+                        Agent(
+                            "",
+                            pane,
+                            pane.split(":")[0],
+                            "unknown",
+                            "unknown",
+                            terminal_id=Agent.parse(panes[0]).terminal_id,
+                        )
+                    ]
         if len(matches) != 1:
             raise ValueError(
                 "Không xác định được một pane duy nhất. Dùng /agents và chỉ định Pane ID đầy đủ."
@@ -156,7 +177,12 @@ class Runtime:
             matches = [a for a in agents if a.identity == agent.identity]
         else:
             rows = await self.panes()
-            matches = [agent for row in rows if row.get("pane_id") == agent.pane]
+            matches = [
+                replace(agent, terminal_id=Agent.parse(row).terminal_id)
+                for row in rows
+                if row.get("pane_id") == agent.pane
+            ]
+            matches = [a for a in matches if a.identity == agent.identity]
         if len(matches) != 1:
             raise ValueError("Pane/agent không còn tồn tại. Dùng /agents để làm mới.")
         current = matches[0]
@@ -205,6 +231,12 @@ class Runtime:
             # Only text replies/choices and Enter depend on the displayed question.
             require_version = not prompt and key not in {"ctrl+c", "up", "down", "space", "tab", "esc"}
             current = await self.fresh(agent, meta, require_version=require_version)
+            if not agent.terminal_id or not current.terminal_id:
+                raise ValueError("Không xác minh được terminal_id; không gửi lệnh. Dùng /agents để làm mới.")
+            if agent.name:
+                rows = [row for row in await self.panes() if row.get("pane_id") == agent.pane]
+                if len(rows) != 1 or Agent.parse(rows[0]).terminal_id != agent.terminal_id:
+                    raise ValueError("Không xác minh được terminal_id của pane hiện tại; không gửi lệnh.")
             # Mark before writing: a timeout leaves the outcome uncertain, so old buttons cannot retry.
             if consume and meta:
                 self.registry.consume(meta)
@@ -302,14 +334,19 @@ class Runtime:
                     return
                 await self.execute_target(message, update.effective_user.id, agent, intent)
             elif command in {"/reply", "/key"}:
-                if not args:
+                parts = message.text.split(maxsplit=1)
+                if len(parts) < 2:
                     raise ValueError(f"Cú pháp: {command} [pane_id] <nội dung/phím>")
-                explicit = ":" in args[0] or args[0].startswith("w") and args[0][1:].isdigit()
-                if explicit and len(args) < 2:
+                body = parts[1]
+                fields = body.split(maxsplit=1)
+                target = fields[0]
+                explicit = ":" in target or target.startswith("w") and target[1:].isdigit()
+                value = fields[1] if explicit and len(fields) == 2 else ("" if explicit else body)
+                if not value.strip():
                     raise ValueError(f"Cú pháp: {command} <pane_id> <nội dung/phím>")
-                agent = await self.find(args[0] if explicit else None)
-                value = " ".join(args[1:] if explicit else args)
+                agent = await self.find(target if explicit else None)
                 if command == "/key":
+                    value = " ".join(value.split())
                     if value.lower() not in KEYS:
                         raise ValueError("Phím hỗ trợ: " + ", ".join(sorted(KEYS)))
                     current = await self.write(update.effective_user.id, agent, key=value.lower())

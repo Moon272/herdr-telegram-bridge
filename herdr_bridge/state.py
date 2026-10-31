@@ -61,13 +61,13 @@ class Agent:
             str(row.get("terminal_title_stripped") or row.get("terminal_title") or ""),
             str(row.get("agent_name") or row.get("custom_name") or row.get("name") or ""),
             "",
-            str(row.get("terminal_id") or ""),
+            row["terminal_id"].strip() if isinstance(row.get("terminal_id"), str) else "",
             str(row.get("workspace_label") or row.get("workspace_name") or ""),
         )
 
     @property
     def identity(self):
-        return self.pane, self.terminal_id, self.name
+        return self.pane, self.terminal_id or self.alias_key, self.name
 
     @property
     def alias_key(self):
