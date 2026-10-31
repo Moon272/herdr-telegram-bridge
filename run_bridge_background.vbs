@@ -1,3 +1,7 @@
 Set WshShell = CreateObject("WScript.Shell")
-    WshShell.CurrentDirectory = "C:\Users\Vinh-Dev\Desktop\Projects\Herdr\herdr-telegram-bridge"
-    WshShell.Run "C:\Users\Vinh-Dev\Desktop\Projects\Herdr\herdr-telegram-bridge\.venv\Scripts\python.exe bridge.py", 0, False
+Set FileSystem = CreateObject("Scripting.FileSystemObject")
+ProjectDirectory = FileSystem.GetParentFolderName(WScript.ScriptFullName)
+PythonExecutable = FileSystem.BuildPath(ProjectDirectory, ".venv\Scripts\python.exe")
+BridgeScript = FileSystem.BuildPath(ProjectDirectory, "bridge.py")
+WshShell.CurrentDirectory = ProjectDirectory
+WshShell.Run Chr(34) & PythonExecutable & Chr(34) & " " & Chr(34) & BridgeScript & Chr(34), 0, False

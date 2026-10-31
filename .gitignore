@@ -46,3 +46,10 @@ desktop.ini
 .idea/
 *.sublime-project
 *.sublime-workspace
+
+# Development caches
+.pytest_cache/
+.ruff_cache/
+
+# Local session display names
+data/
